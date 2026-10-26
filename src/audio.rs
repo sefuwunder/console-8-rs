@@ -193,24 +193,40 @@ impl AudioSystem {
 
     /// Reconcile input streams with the engine's armed tracks.
     /// Safe to call every frame; only starts/stops on change.
-    pub fn ensure_inputs(&mut self) {
-        let wanted: HashMap<String, Vec<usize>> = {
-            let eng = match self.engine.lock() {
-                Ok(e) => e,
-                Err(_) => return,
-            };
-            let mut wanted: HashMap<String, Vec<usize>> = HashMap::new();
-            for i in 0..N_TRACKS {
-                let t = &eng.session.tracks[i];
-                if !t.armed {
-                    continue;
-                }
-                if let InputSel::Device(name) = &t.input {
-                    wanted.entry(name.clone()).or_default().push(i);
-                }
-            }
-            wanted
+    /// Armed device tracks, read under the engine lock.
+    fn wanted_inputs(&self) -> HashMap<String, Vec<usize>> {
+        let eng = match self.engine.lock() {
+            Ok(e) => e,
+            Err(_) => return HashMap::new(),
         };
+        let mut wanted: HashMap<String, Vec<usize>> = HashMap::new();
+        for i in 0..N_TRACKS {
+            let t = &eng.session.tracks[i];
+            if !t.armed {
+                continue;
+            }
+            if let InputSel::Device(name) = &t.input {
+                wanted.entry(name.clone()).or_default().push(i);
+            }
+        }
+        wanted
+    }
+
+    /// Reconcile input streams with the engine's armed tracks.
+    /// Only call when the engine guard is NOT held (startup, arm/input
+    /// buttons after drop). do_play/do_rec call ensure_inputs_for
+    /// instead: they run under a held guard, and re-locking the same
+    /// non-reentrant Mutex deadlocked the UI thread on 2026-10-26
+    /// (window froze on PLAY after REC, GNOME force-quit it).
+    pub fn ensure_inputs(&mut self) {
+        let wanted = self.wanted_inputs();
+        self.ensure_inputs_for(&wanted);
+    }
+
+    /// Reconcile input streams with a caller-supplied wanted map.
+    /// Never locks the engine, so it is safe to call while the caller
+    /// already holds the engine guard.
+    pub fn ensure_inputs_for(&mut self, wanted: &HashMap<String, Vec<usize>>) {
         // Stop streams nobody wants anymore.
         let current: Vec<String> = self.input_streams.keys().cloned().collect();
         for name in current {

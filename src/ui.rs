@@ -18,6 +18,7 @@ use sdl2::mouse::MouseButton;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, RenderTarget};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -665,12 +666,31 @@ fn save_session(ui: &mut Ui, eng: &Engine) {
     }
 }
 
+/// Armed device tracks of an engine the caller already holds.
+/// do_play/do_rec build the wanted map from `eng` and reconcile via
+/// ensure_inputs_for: calling ensure_inputs here would re-lock the
+/// engine guard the caller holds and deadlock the UI thread.
+fn wanted_from(eng: &Engine) -> HashMap<String, Vec<usize>> {
+    let mut wanted: HashMap<String, Vec<usize>> = HashMap::new();
+    for i in 0..N_TRACKS {
+        let t = &eng.session.tracks[i];
+        if !t.armed {
+            continue;
+        }
+        if let InputSel::Device(name) = &t.input {
+            wanted.entry(name.clone()).or_default().push(i);
+        }
+    }
+    wanted
+}
+
 fn do_play(ui: &mut Ui, eng: &mut Engine, audio: &mut AudioSystem) {
     if !eng.playing {
         eng.playing = true;
         if ui.rec_pending && !eng.recording() {
             eng.begin_recording();
-            audio.ensure_inputs();
+            let wanted = wanted_from(eng);
+            audio.ensure_inputs_for(&wanted);
         }
     }
 }
@@ -691,7 +711,8 @@ fn do_rec(ui: &mut Ui, eng: &mut Engine, audio: &mut AudioSystem) {
             eng.end_recording();
         } else {
             eng.begin_recording();
-            audio.ensure_inputs();
+            let wanted = wanted_from(eng);
+            audio.ensure_inputs_for(&wanted);
         }
     } else {
         ui.rec_pending = !ui.rec_pending;
@@ -1524,4 +1545,65 @@ pub fn run() -> i32 {
         i += 1;
     }
     live(session_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn play_after_rec_pending_does_not_deadlock_under_guard() {
+        // Regression for 2026-10-26: pressing PLAY with REC pending
+        // froze the window (GNOME force-quit it) because do_play
+        // called ensure_inputs() while the caller held the engine
+        // guard, and ensure_inputs re-locked the same non-reentrant
+        // Mutex. Run the exact sequence on a worker thread and fail
+        // (don't hang the suite) if it doesn't return in 5s.
+        let dir = std::env::temp_dir().join("console8rs-deadlock-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("takes")).unwrap();
+        let mut s = Session::new("t", 48000);
+        s.tracks[0].armed = true;
+        s.tracks[0].input = InputSel::Device("no-such-device".to_string());
+        let engine = Arc::new(Mutex::new(Engine::new(s, dir.clone())));
+        let mut ui = Ui {
+            engine: engine.clone(),
+            session_dir: dir.clone(),
+            view_start: 0,
+            view_len: 60 * 48000,
+            selected: None,
+            rec_pending: true,
+            dirty: false,
+            saved_flash: 0,
+            drag: None,
+            mouse: (0, 0),
+            audio_ok: false,
+            audio_error: None,
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        // AudioSystem is constructed inside the worker: it holds
+        // cpal::Stream handles, which are not Send.
+        let handle = std::thread::spawn(move || {
+            let mut audio = AudioSystem::new(engine.clone(), 48000);
+            let mut eng = engine.lock().unwrap();
+            do_play(&mut ui, &mut eng, &mut audio);
+            do_stop(&mut ui, &mut eng, &mut audio);
+            done2.store(true, Ordering::SeqCst);
+        });
+        for _ in 0..50 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            done.load(Ordering::SeqCst),
+            "do_play deadlocked under a held engine guard"
+        );
+        let _ = handle.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

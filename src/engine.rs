@@ -582,6 +582,49 @@ mod tests {
     }
 
     #[test]
+    fn recorder_keeps_up_at_realtime_pace() {
+        // Regression probe for the 2026-10-26 on-machine OOM-kill report:
+        // feed the recorder at exactly realtime pace and watch RSS. If the
+        // writer thread falls behind the input rate, the unbounded channel
+        // backlogs and RSS climbs with the audio pushed; a healthy writer
+        // keeps RSS flat.
+        fn rss_kb() -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| {
+                        l.split_whitespace().nth(1).and_then(|v| v.parse().ok())
+                    })
+                })
+                .unwrap_or(0)
+        }
+        let dir = test_dir("rtpace");
+        let s = Session::new("t", 48000);
+        let mut eng = Engine::new(s, dir.clone());
+        eng.session.tracks[0].armed = true;
+        eng.session.tracks[0].input = InputSel::Tone;
+        let started = eng.begin_recording();
+        assert_eq!(started.len(), 1);
+        let chunk = vec![0.3; 1024];
+        let chunk_dur = std::time::Duration::from_micros(1024 * 1_000_000 / 48000);
+        let t0 = rss_kb();
+        // ~6s of audio at realtime pace, sampled every ~2s.
+        for i in 0..280 {
+            eng.push_input(0, &chunk);
+            if i % 94 == 0 {
+                eprintln!("rss sample i={} {} kB", i, rss_kb());
+            }
+            std::thread::sleep(chunk_dur);
+        }
+        let t1 = rss_kb();
+        let done = eng.end_recording();
+        assert_eq!(done.len(), 1);
+        assert!(done[0].2 >= 280 * 1024, "take should hold all pushed frames");
+        eprintln!("rss before={} kB after_push={} kB", t0, t1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn monitor_passes_through_when_stopped() {
         let dir = test_dir("mon");
         let s = Session::new("t", 48000);
