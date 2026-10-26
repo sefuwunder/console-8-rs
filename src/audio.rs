@@ -77,7 +77,8 @@ pub struct AudioSystem {
     pub last_error: Option<String>,
 }
 
-/// PipeWire Audio/Source nodes (mics and sink monitors). The timeout
+/// PipeWire recordable nodes: Audio/Source nodes (mics) and
+/// Audio/Sink nodes (captured via their monitor ports). The timeout
 /// keeps a wedged daemon from stalling the caller.
 pub fn list_pw_sources(timeout: Duration) -> Result<Vec<PwSource>, String> {
     crate::pw::list_sources_timeout(timeout)

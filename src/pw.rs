@@ -35,19 +35,30 @@ fn init_once() {
     ONCE.call_once(pw::init);
 }
 
-/// One PipeWire audio source: a mic, or a sink monitor (internal app
-/// audio). `name` is the stable node name used for capture; `description`
-/// is the human-readable label shown by --list-devices.
+/// One PipeWire recordable node: an Audio/Source (a mic) or an
+/// Audio/Sink (captured via its monitor ports: internal app audio).
+/// `name` is the stable node name used for capture; `description` is
+/// the human-readable label shown by --list-devices. `is_sink` marks
+/// sink monitors, listed after sources so the input cycle stays
+/// predictable.
+///
+/// Correction (2026-10-26, lab-verified against a live daemon): sink
+/// monitors are NOT Audio/Source nodes. A sink exposes monitor_FL /
+/// monitor_FR output ports on the sink node itself; no separate
+/// ".monitor" node exists in native PipeWire (that naming is
+/// pipewire-pulse's). Filtering on Audio/Source alone could therefore
+/// never list a monitor, which is why only the mic ever appeared.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PwSource {
     pub name: String,
     pub description: String,
+    pub is_sink: bool,
 }
 
-/// Enumerate Audio/Source nodes, with a timeout so a wedged daemon can
-/// never freeze the UI thread. The roundtrip itself runs on a worker
-/// thread; on timeout the thread is abandoned (it exits on its own once
-/// the daemon answers).
+/// Enumerate recordable nodes (Audio/Source + Audio/Sink), with a
+/// timeout so a wedged daemon can never freeze the UI thread. The
+/// roundtrip itself runs on a worker thread; on timeout the thread is
+/// abandoned (it exits on its own once the daemon answers).
 pub fn list_sources_timeout(timeout: Duration) -> Result<Vec<PwSource>, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -68,18 +79,20 @@ fn list_sources_sync() -> Result<Vec<PwSource>, String> {
     let nodes = collect_nodes_on(&mainloop, &core)?;
     let mut out: Vec<PwSource> = nodes
         .into_iter()
-        .map(|(_, name, desc)| PwSource {
+        .map(|(_, name, desc, is_sink)| PwSource {
             name,
             description: desc,
+            is_sink,
         })
         .collect();
-    out.sort_by(|a, b| a.description.cmp(&b.description));
+    out.sort_by(|a, b| (a.is_sink, &a.description).cmp(&(b.is_sink, &b.description)));
     out.dedup_by(|a, b| a.name == b.name);
     Ok(out)
 }
 
-/// One registry roundtrip: (id, node.name, node.description) for every
-/// Audio/Source node. Runs on the calling thread's MainLoop.
+/// One registry roundtrip: (id, node.name, node.description, is_sink)
+/// for every Audio/Source and Audio/Sink node. Runs on the calling
+/// thread's MainLoop.
 
 /// Little-endian bytes -> f32 samples (truncates a trailing partial
 /// sample). Pure, so it is unit-testable without a daemon.
@@ -231,9 +244,9 @@ fn capture_thread(
     };
     let node_id = nodes
         .iter()
-        .find(|(_, n, _)| n == &node_name)
-        .or_else(|| nodes.iter().find(|(_, _, d)| d == &node_name))
-        .map(|(id, _, _)| *id);
+        .find(|(_, n, _, _)| n == &node_name)
+        .or_else(|| nodes.iter().find(|(_, _, d, _)| d == &node_name))
+        .map(|(id, _, _, _)| *id);
     let Some(node_id) = node_id else {
         set_err(format!("pipewire source gone: {node_name}"));
         return;
@@ -350,9 +363,10 @@ fn capture_thread(
 fn collect_nodes_on(
     mainloop: &pw::main_loop::MainLoop,
     core: &pw::core::Core,
-) -> Result<Vec<(u32, String, String)>, String> {
+) -> Result<Vec<(u32, String, String, bool)>, String> {
     let registry = core.get_registry().map_err(|e| format!("pipewire: {e}"))?;
-    let nodes: Rc<RefCell<Vec<(u32, String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    let nodes: Rc<RefCell<Vec<(u32, String, String, bool)>>> =
+        Rc::new(RefCell::new(Vec::new()));
     let nodes2 = nodes.clone();
     let _reg_listener = registry
         .add_listener_local()
@@ -361,14 +375,20 @@ fn collect_nodes_on(
                 return;
             }
             let Some(props) = obj.props else { return };
-            if props.get("media.class") != Some("Audio/Source") {
-                return;
-            }
+            // Sources AND sinks: a sink's monitor is its own output
+            // ports, not a separate node (see PwSource docs).
+            let is_sink = match props.get("media.class") {
+                Some("Audio/Source") => false,
+                Some("Audio/Sink") => true,
+                _ => return,
+            };
             let Some(name) = props.get("node.name") else {
                 return;
             };
             let desc = props.get("node.description").unwrap_or(name).to_string();
-            nodes2.borrow_mut().push((obj.id, name.to_string(), desc));
+            nodes2
+                .borrow_mut()
+                .push((obj.id, name.to_string(), desc, is_sink));
         })
         .register();
     let done = Rc::new(Cell::new(false));
@@ -387,7 +407,7 @@ fn collect_nodes_on(
     while !done.get() {
         mainloop.run();
     }
-    let result: Vec<(u32, String, String)> = nodes.borrow().iter().cloned().collect();
+    let result: Vec<(u32, String, String, bool)> = nodes.borrow().iter().cloned().collect();
     Ok(result)
 }
 
@@ -424,5 +444,71 @@ mod tests {
         assert_eq!(info.format(), AudioFormat::F32LE);
         assert_eq!(info.rate(), 48000);
         assert_eq!(info.channels(), 2);
+    }
+
+    /// Manual live test: needs a PipeWire daemon plus audio playing
+    /// into a sink (e.g., a null sink fed by pw-play). NOT run by the
+    /// default suite (no daemon in CI/VM). Run with:
+    ///   cargo test --release capture_from_live_sink_monitor -- --ignored --nocapture
+    /// Env PW_TEST_NODE overrides which node name to capture;
+    /// otherwise the first Audio/Sink wins. The sink's monitor ports
+    /// carry the sink's mix; the capture stream connects to the sink
+    /// node id directly, exactly like a source.
+    #[test]
+    #[ignore]
+    fn capture_from_live_sink_monitor() {
+        let dir = std::env::temp_dir().join("console8rs-pw-live");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("takes")).unwrap();
+        let engine = Arc::new(Mutex::new(Engine::new(
+            crate::session::Session::new("t", 48000),
+            dir.clone(),
+        )));
+        let hub = Arc::new(MonitorHub::new());
+        let subs = Arc::new(Mutex::new(HashMap::new()));
+        let err = Arc::new(Mutex::new(None::<String>));
+        let nodes = list_sources_timeout(Duration::from_secs(5))
+            .expect("daemon must be reachable for the live test");
+        let wanted = std::env::var("PW_TEST_NODE").ok();
+        let node = wanted
+            .as_deref()
+            .and_then(|w| nodes.iter().find(|s| s.name == w))
+            .or_else(|| nodes.iter().find(|s| s.is_sink))
+            .expect("no sink found; play audio into a sink first");
+        eprintln!("capturing monitor of {} ({})", node.description, node.name);
+        subs.lock()
+            .unwrap()
+            .insert(node.name.clone(), vec![0]);
+        let cap = PwCapture::start(
+            engine.clone(),
+            hub.clone(),
+            subs.clone(),
+            &node.name,
+            48000,
+            err.clone(),
+        )
+        .expect("capture thread must start");
+        // Playback must already be running externally; collect a few
+        // seconds (PW_TEST_SLEEP_SECS stretches the window for graph
+        // inspection during a live run).
+        let sleep_secs: u64 = std::env::var("PW_TEST_SLEEP_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        std::thread::sleep(Duration::from_secs(sleep_secs));
+        cap.stop();
+        let frames = hub.drain(0, 48000 * 3);
+        let peak = frames.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        eprintln!("captured {} frames, peak {}", frames.len(), peak);
+        assert!(
+            err.lock().unwrap().is_none(),
+            "capture error: {:?}",
+            err.lock().unwrap()
+        );
+        assert!(
+            peak > 0.05,
+            "sink-monitor capture must carry audible audio, got peak {peak}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

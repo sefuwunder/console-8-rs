@@ -1542,12 +1542,24 @@ pub fn run() -> i32 {
                 }
                 match list_pw_sources(std::time::Duration::from_secs(5)) {
                     Ok(srcs) => {
-                        if srcs.is_empty() {
-                            println!("no pipewire sources enumerated");
+                        let sources: Vec<&_> =
+                            srcs.iter().filter(|s| !s.is_sink).collect();
+                        let sinks: Vec<&_> =
+                            srcs.iter().filter(|s| s.is_sink).collect();
+                        if sources.is_empty() && sinks.is_empty() {
+                            println!("no pipewire sources or sinks enumerated");
                         } else {
-                            println!("pipewire sources:");
-                            for s in srcs {
-                                println!("  {} ({})", s.description, s.name);
+                            if !sources.is_empty() {
+                                println!("pipewire sources:");
+                                for s in sources {
+                                    println!("  {} ({})", s.description, s.name);
+                                }
+                            }
+                            if !sinks.is_empty() {
+                                println!("pipewire sink monitors:");
+                                for s in sinks {
+                                    println!("  {} ({})", s.description, s.name);
+                                }
                             }
                         }
                     }

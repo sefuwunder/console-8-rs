@@ -83,15 +83,18 @@ Run from the repo root so `sessions/` lands next to the binary;
 ## Inputs: mic and internal app audio
 
 Each track's input button cycles `NO INPUT` → `TONE` → ALSA devices
-→ PipeWire sources. PipeWire sources include sink monitors, which
-is how internal app audio is captured: start the drum machine or
-synth so its sink exists, arm a track, cycle its input to the
-`...monitor` node, then REC + PLAY. The monitor is downmixed to
-mono and recorded raw, pre-strip, like any other input.
-`--list-devices` prints PipeWire sources with descriptions so you
-can identify the right monitor. PipeWire capture runs on its own
-thread per node; if the daemon is absent or a node vanishes, the
-footer shows the error instead of freezing.
+→ PipeWire sources → PipeWire sink monitors. Sink monitors are how
+internal app audio is captured: in native PipeWire a sink's monitor
+is not a separate node but the sink's own monitor output ports, so
+the cycle lists the sink itself (e.g. `alsa_output...analog-stereo`,
+shown under "pipewire sink monitors" by `--list-devices`). Arm a
+track, cycle its input to the sink, then REC + PLAY: the sink's mix
+is captured, downmixed to mono, and recorded raw, pre-strip, like
+any other input. The sink is listed whenever it exists, even idle;
+its monitor ports only carry audio while something plays into it.
+PipeWire capture runs on its own thread per node; if the daemon is
+absent or a node vanishes, the footer shows the error instead of
+freezing.
 
 ## Signal chain
 
@@ -108,12 +111,12 @@ monitor and the mix, never the take itself.
 
 ## Honest limits
 
-- Live capture is verified on real hardware for the mic only; this
-  VM has no sound devices and no PipeWire daemon, so PipeWire
-  enumeration and capture are verified structurally (format and
-  conversion unit tests, a no-daemon failure test) and the
-  record/mix paths end to end from files. Try a monitor node on
-  your machine and report what `--list-devices` shows.
+- Live capture is verified on real hardware for the mic only. PipeWire
+  sink-monitor capture is verified end to end in a lab daemon (null
+  sink + pw-play tone in, monitor capture out at full level), but
+  not yet against a real desktop sink on a user's machine; the
+  ignored `capture_from_live_sink_monitor` test is the lab check.
+  Record/mix paths are verified end to end from files.
 - The engine shares one Mutex between the UI and the audio
   callbacks; a disk stall in the render callback can briefly stall
   input. Fine for an 8-track; a lock-free design is the next step
