@@ -19,6 +19,10 @@ pub enum InputSel {
     None,
     Tone,
     Device(String),
+    /// PipeWire node name (a mic or a sink monitor for internal app
+    /// audio). Resolved to a live node id at capture start; names are
+    /// stable across daemon restarts, ids are not.
+    PipeWire(String),
 }
 
 impl InputSel {
@@ -31,6 +35,10 @@ impl InputSel {
                 let short: String = name.chars().take(14).collect();
                 format!("{short}")
             }
+            InputSel::PipeWire(name) => {
+                let short: String = name.chars().take(14).collect();
+                format!("{short}")
+            }
         }
     }
 
@@ -39,6 +47,7 @@ impl InputSel {
             InputSel::None => "none".to_string(),
             InputSel::Tone => "tone".to_string(),
             InputSel::Device(name) => format!("dev:{}", escape(name)),
+            InputSel::PipeWire(name) => format!("pw:{}", escape(name)),
         }
     }
 
@@ -48,7 +57,11 @@ impl InputSel {
             "tone" => Some(InputSel::Tone),
             _ => s
                 .strip_prefix("dev:")
-                .map(|rest| InputSel::Device(unescape(rest))),
+                .map(|rest| InputSel::Device(unescape(rest)))
+                .or_else(|| {
+                    s.strip_prefix("pw:")
+                        .map(|rest| InputSel::PipeWire(unescape(rest)))
+                }),
         }
     }
 }
@@ -511,6 +524,8 @@ mod tests {
         s.tracks[2].strip.pan = -0.25;
         s.tracks[5].input = InputSel::Tone;
         s.tracks[5].solo = true;
+        s.tracks[6].input =
+            InputSel::PipeWire("alsa_output.pci-0000_00_1f.3.analog-stereo.monitor".to_string());
         let _ = s.add_region(2, "take-2-123.wav", 48000, 0, 96000);
         let _ = s.add_region(2, "take-2-456.wav", 200000, 4800, 48000);
         let text = s.to_text();
@@ -529,6 +544,10 @@ mod tests {
         assert_eq!(s2.tracks[2].regions[1].offset, 4800);
         assert_eq!(s2.tracks[5].input, InputSel::Tone);
         assert!(s2.tracks[5].solo);
+        assert_eq!(
+            s2.tracks[6].input,
+            InputSel::PipeWire("alsa_output.pci-0000_00_1f.3.analog-stereo.monitor".to_string())
+        );
         // Re-serializing is stable.
         assert_eq!(s2.to_text(), text);
     }

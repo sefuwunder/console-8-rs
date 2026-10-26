@@ -6,7 +6,7 @@
 //! 8 lanes), strips 456..856, footer 856..900. Strips are 155 px
 //! wide; the master strip takes the last 200 px.
 
-use crate::audio::{list_input_devices, AudioSystem};
+use crate::audio::{list_input_devices, list_pw_sources, AudioSystem};
 use crate::dsp::StripParams;
 use crate::engine::Engine;
 use crate::font::{draw_text, text_width};
@@ -684,6 +684,22 @@ fn wanted_from(eng: &Engine) -> HashMap<String, Vec<usize>> {
     wanted
 }
 
+/// Armed PipeWire node names of an engine the caller already holds
+/// (same no-re-lock rule as wanted_from).
+fn wanted_pw_from(eng: &Engine) -> HashMap<String, Vec<usize>> {
+    let mut wanted: HashMap<String, Vec<usize>> = HashMap::new();
+    for i in 0..N_TRACKS {
+        let t = &eng.session.tracks[i];
+        if !t.armed {
+            continue;
+        }
+        if let InputSel::PipeWire(name) = &t.input {
+            wanted.entry(name.clone()).or_default().push(i);
+        }
+    }
+    wanted
+}
+
 fn do_play(ui: &mut Ui, eng: &mut Engine, audio: &mut AudioSystem) {
     if !eng.playing {
         eng.playing = true;
@@ -691,6 +707,8 @@ fn do_play(ui: &mut Ui, eng: &mut Engine, audio: &mut AudioSystem) {
             eng.begin_recording();
             let wanted = wanted_from(eng);
             audio.ensure_inputs_for(&wanted);
+            let pw_wanted = wanted_pw_from(eng);
+            audio.ensure_pw_inputs_for(&pw_wanted);
         }
     }
 }
@@ -713,17 +731,22 @@ fn do_rec(ui: &mut Ui, eng: &mut Engine, audio: &mut AudioSystem) {
             eng.begin_recording();
             let wanted = wanted_from(eng);
             audio.ensure_inputs_for(&wanted);
+            let pw_wanted = wanted_pw_from(eng);
+            audio.ensure_pw_inputs_for(&pw_wanted);
         }
     } else {
         ui.rec_pending = !ui.rec_pending;
     }
 }
 
-fn cycle_input(current: &InputSel, devices: &[String]) -> InputSel {
-    // Cycle: None -> Tone -> devices... -> None.
+fn cycle_input(current: &InputSel, devices: &[String], pw: &[String]) -> InputSel {
+    // Cycle: None -> Tone -> ALSA devices... -> PipeWire sources... -> None.
     let mut order: Vec<InputSel> = vec![InputSel::None, InputSel::Tone];
     for d in devices {
         order.push(InputSel::Device(d.clone()));
+    }
+    for n in pw {
+        order.push(InputSel::PipeWire(n.clone()));
     }
     let pos = order.iter().position(|x| x == current).unwrap_or(0);
     order[(pos + 1) % order.len()].clone()
@@ -932,6 +955,7 @@ fn live(session_dir: PathBuf) -> i32 {
     let mut audio = AudioSystem::new(engine.clone(), sr);
     audio.start_output();
     audio.ensure_inputs();
+    audio.ensure_pw_inputs();
 
     let sdl = match sdl2::init() {
         Ok(s) => s,
@@ -1119,6 +1143,7 @@ fn live(session_dir: PathBuf) -> i32 {
                 ui.saved_flash -= 1;
             }
             ui.audio_ok = audio.output_ok();
+            audio.poll_pw_error();
             ui.audio_error = audio.last_error.clone();
             draw_frame(&mut canvas, &ui, &eng);
         }
@@ -1328,16 +1353,29 @@ fn handle_mousedown(ui: &mut Ui, audio: &mut AudioSystem, x: i32, y: i32) {
                 ui.dirty = true;
                 drop(eng);
                 audio.ensure_inputs();
+                audio.ensure_pw_inputs();
                 return;
             }
             if y >= ly + 26 && y < ly + 44 && x >= 8 && x < 192 {
                 let devices = list_input_devices();
+                // PipeWire enumeration is capped at 1s so a wedged
+                // daemon costs a slow button press, never a freeze.
+                let pw_names: Vec<String> = match list_pw_sources(
+                    std::time::Duration::from_secs(1),
+                ) {
+                    Ok(srcs) => srcs.iter().map(|s| s.name.clone()).collect(),
+                    Err(e) => {
+                        audio.last_error = Some(e);
+                        Vec::new()
+                    }
+                };
                 let mut eng = ui.engine.lock().unwrap();
                 let cur = eng.session.tracks[track].input.clone();
-                eng.session.tracks[track].input = cycle_input(&cur, &devices);
+                eng.session.tracks[track].input = cycle_input(&cur, &devices, &pw_names);
                 ui.dirty = true;
                 drop(eng);
                 audio.ensure_inputs();
+                audio.ensure_pw_inputs();
                 return;
             }
             return;
@@ -1475,7 +1513,7 @@ fn print_help() {
          usage: console-8-rs [options]\n\
          \n\
          --session <dir>    session dir (default: sessions/default)\n\
-         --list-devices     list cpal input devices and exit\n\
+         --list-devices     list cpal input devices and PipeWire sources and exit\n\
          --smoke [secs]     render a synthetic mix headless, exit 0/1\n\
          --render <out.wav> [secs]  render a synthetic mix to a stereo WAV\n\
          --shot <out.bmp>   render one UI frame to a BMP (dummy video)\n\
@@ -1496,12 +1534,24 @@ pub fn run() -> i32 {
             "--list-devices" => {
                 let devs = list_input_devices();
                 if devs.is_empty() {
-                    println!("no input devices enumerated");
-                    println!("(tip: on PipeWire/PulseAudio, monitor sources appear here once the audio server exposes them; on plain ALSA, load snd-aloop for app capture)");
+                    println!("no cpal input devices enumerated");
                 } else {
                     for d in devs {
                         println!("{d}");
                     }
+                }
+                match list_pw_sources(std::time::Duration::from_secs(5)) {
+                    Ok(srcs) => {
+                        if srcs.is_empty() {
+                            println!("no pipewire sources enumerated");
+                        } else {
+                            println!("pipewire sources:");
+                            for s in srcs {
+                                println!("  {} ({})", s.description, s.name);
+                            }
+                        }
+                    }
+                    Err(e) => println!("pipewire sources unavailable: {e}"),
                 }
                 return 0;
             }
@@ -1604,6 +1654,62 @@ mod tests {
             "do_play deadlocked under a held engine guard"
         );
         let _ = handle.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pw_capture_fails_gracefully_without_daemon() {
+        // No PipeWire daemon runs in this VM. Arming a PipeWire node
+        // and pressing PLAY must still return under the guard, and the
+        // capture thread's failure must surface as a footer error,
+        // never a hang or a panic.
+        let dir = std::env::temp_dir().join("console8rs-pw-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("takes")).unwrap();
+        let mut s = Session::new("t", 48000);
+        s.tracks[0].armed = true;
+        s.tracks[0].input = InputSel::PipeWire("no-such-node".to_string());
+        let engine = Arc::new(Mutex::new(Engine::new(s, dir.clone())));
+        let mut ui = Ui {
+            engine: engine.clone(),
+            session_dir: dir.clone(),
+            view_start: 0,
+            view_len: 60 * 48000,
+            selected: None,
+            rec_pending: true,
+            dirty: false,
+            saved_flash: 0,
+            drag: None,
+            mouse: (0, 0),
+            audio_ok: false,
+            audio_error: None,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut audio = AudioSystem::new(engine.clone(), 48000);
+            let mut eng = engine.lock().unwrap();
+            do_play(&mut ui, &mut eng, &mut audio);
+            // Give the capture thread time to fail connecting, then
+            // surface its error like the live loop does each frame.
+            for _ in 0..20 {
+                audio.poll_pw_error();
+                if audio.last_error.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            do_stop(&mut ui, &mut eng, &mut audio);
+            let _ = tx.send(audio.last_error.clone());
+        });
+        let err = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("pw test thread must finish");
+        let _ = handle.join();
+        let msg = err.expect("capture failure must surface as an error");
+        assert!(
+            msg.contains("pipewire"),
+            "error should name pipewire, got: {msg}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

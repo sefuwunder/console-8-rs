@@ -2,6 +2,7 @@ mod audio;
 mod dsp;
 mod engine;
 mod font;
+mod pw;
 mod session;
 mod ui;
 mod wav;

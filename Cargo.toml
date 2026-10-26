@@ -7,6 +7,7 @@ description = "8-track tape recorder and mixer in Rust + SDL2: disk-streamed tak
 [dependencies]
 sdl2 = "0.37"
 cpal = "0.15"
+pipewire = "0.8"
 
 [profile.release]
 opt-level = 3

@@ -12,11 +12,13 @@
 //! ever showed up.
 
 use crate::engine::Engine;
+use crate::pw::{PwCapture, PwSource};
 use crate::session::{InputSel, N_TRACKS};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleRate, Stream, StreamConfig};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub struct MonitorHub {
     queues: [Arc<Mutex<VecDeque<f32>>>; N_TRACKS],
@@ -59,9 +61,26 @@ pub struct AudioSystem {
     input_streams: HashMap<String, Stream>,
     /// device name -> subscribed tracks (shared with input callbacks)
     input_subs: Arc<Mutex<HashMap<String, Vec<usize>>>>,
+    /// PipeWire node name -> running capture (separate from cpal: a
+    /// PipeWire monitor is not an ALSA device and must never share the
+    /// input_subs key space, where a name collision would cross-feed
+    /// tracks).
+    pw_streams: HashMap<String, PwCapture>,
+    /// PipeWire node name -> subscribed tracks (shared with capture
+    /// threads, same shape as input_subs).
+    pw_subs: Arc<Mutex<HashMap<String, Vec<usize>>>>,
+    /// Capture threads report here; poll_pw_error moves it to
+    /// last_error so the footer shows it within a frame.
+    pw_error: Arc<Mutex<Option<String>>>,
     sample_rate: u32,
     tone_phase: Arc<Mutex<f32>>,
     pub last_error: Option<String>,
+}
+
+/// PipeWire Audio/Source nodes (mics and sink monitors). The timeout
+/// keeps a wedged daemon from stalling the caller.
+pub fn list_pw_sources(timeout: Duration) -> Result<Vec<PwSource>, String> {
+    crate::pw::list_sources_timeout(timeout)
 }
 
 pub fn list_input_devices() -> Vec<String> {
@@ -87,9 +106,23 @@ impl AudioSystem {
             output_stream: None,
             input_streams: HashMap::new(),
             input_subs: Arc::new(Mutex::new(HashMap::new())),
+            pw_streams: HashMap::new(),
+            pw_subs: Arc::new(Mutex::new(HashMap::new())),
+            pw_error: Arc::new(Mutex::new(None)),
             sample_rate,
             tone_phase: Arc::new(Mutex::new(0.0)),
             last_error: None,
+        }
+    }
+
+    /// Move a capture-thread error into last_error (footer reads it
+    /// every frame). Call from the live loop, not from under the
+    /// engine guard: it only touches the error slot, never the engine.
+    pub fn poll_pw_error(&mut self) {
+        if let Ok(mut e) = self.pw_error.lock() {
+            if let Some(msg) = e.take() {
+                self.last_error = Some(msg);
+            }
         }
     }
 
@@ -312,6 +345,81 @@ impl AudioSystem {
                 }
                 Err(e) => {
                     self.last_error = Some(format!("input {name} failed ({e})"));
+                }
+            }
+        }
+    }
+
+    /// Armed PipeWire node names, read under the engine lock.
+    fn wanted_pw_inputs(&self) -> HashMap<String, Vec<usize>> {
+        let eng = match self.engine.lock() {
+            Ok(e) => e,
+            Err(_) => return HashMap::new(),
+        };
+        let mut wanted: HashMap<String, Vec<usize>> = HashMap::new();
+        for i in 0..N_TRACKS {
+            let t = &eng.session.tracks[i];
+            if !t.armed {
+                continue;
+            }
+            if let InputSel::PipeWire(name) = &t.input {
+                wanted.entry(name.clone()).or_default().push(i);
+            }
+        }
+        wanted
+    }
+
+    /// Reconcile PipeWire captures with the engine's armed tracks.
+    /// Only call when the engine guard is NOT held (same rule as
+    /// ensure_inputs); do_play/do_rec use ensure_pw_inputs_for.
+    pub fn ensure_pw_inputs(&mut self) {
+        let wanted = self.wanted_pw_inputs();
+        self.ensure_pw_inputs_for(&wanted);
+    }
+
+    /// Reconcile PipeWire captures with a caller-supplied wanted map.
+    /// Never locks the engine and never enumerates: capture threads
+    /// resolve node names to ids themselves, so this returns
+    /// immediately even if the daemon is slow. Stopping a capture only
+    /// sends a quit message (never joins), so it is safe under the
+    /// engine guard.
+    pub fn ensure_pw_inputs_for(&mut self, wanted: &HashMap<String, Vec<usize>>) {
+        // Stop captures nobody wants anymore (drop asks the thread to
+        // quit; the thread exits on its own).
+        let current: Vec<String> = self.pw_streams.keys().cloned().collect();
+        for name in current {
+            if !wanted.contains_key(&name) {
+                self.pw_streams.remove(&name);
+                if let Ok(mut subs) = self.pw_subs.lock() {
+                    subs.remove(&name);
+                }
+            }
+        }
+        // Start captures for newly wanted nodes.
+        for (name, tracks) in wanted.iter() {
+            if self.pw_streams.contains_key(name) {
+                if let Ok(mut subs) = self.pw_subs.lock() {
+                    subs.insert(name.clone(), tracks.clone());
+                }
+                continue;
+            }
+            if let Ok(mut subs) = self.pw_subs.lock() {
+                subs.insert(name.clone(), tracks.clone());
+            }
+            match PwCapture::start(
+                self.engine.clone(),
+                self.hub.clone(),
+                self.pw_subs.clone(),
+                name,
+                self.sample_rate,
+                self.pw_error.clone(),
+            ) {
+                Ok(cap) => {
+                    self.pw_streams.insert(name.clone(), cap);
+                    self.last_error = None;
+                }
+                Err(e) => {
+                    self.last_error = Some(e);
                 }
             }
         }

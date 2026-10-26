@@ -64,7 +64,9 @@ selection, `Left`/`Right` playhead ±1 s (`Shift` ±10 s),
 ## Build and run
 
 ```sh
-# Needs libsdl2-dev and libasound2-dev (Debian/Ubuntu).
+# Needs libsdl2-dev, libasound2-dev, libpipewire-0.3-dev and
+# libclang-dev (Debian/Ubuntu; libclang is for the PipeWire bindings'
+# bindgen step, needed at build time only).
 cargo build --release
 ./target/release/console-8-rs [--session <dir>]
 
@@ -77,6 +79,19 @@ cargo build --release
 
 Run from the repo root so `sessions/` lands next to the binary;
 `sessions/` is gitignored — takes are your audio, never pushed.
+
+## Inputs: mic and internal app audio
+
+Each track's input button cycles `NO INPUT` → `TONE` → ALSA devices
+→ PipeWire sources. PipeWire sources include sink monitors, which
+is how internal app audio is captured: start the drum machine or
+synth so its sink exists, arm a track, cycle its input to the
+`...monitor` node, then REC + PLAY. The monitor is downmixed to
+mono and recorded raw, pre-strip, like any other input.
+`--list-devices` prints PipeWire sources with descriptions so you
+can identify the right monitor. PipeWire capture runs on its own
+thread per node; if the daemon is absent or a node vanishes, the
+footer shows the error instead of freezing.
 
 ## Signal chain
 
@@ -93,11 +108,12 @@ monitor and the mix, never the take itself.
 
 ## Honest limits
 
-- Live mic / app-audio capture is untested on real hardware: this
-  VM has no sound devices, so device enumeration, input streams,
-  and the tone path are verified structurally and the mix/record
-  paths are verified end to end from files. Try a mic on your
-  machine and report what `--list-devices` shows.
+- Live capture is verified on real hardware for the mic only; this
+  VM has no sound devices and no PipeWire daemon, so PipeWire
+  enumeration and capture are verified structurally (format and
+  conversion unit tests, a no-daemon failure test) and the
+  record/mix paths end to end from files. Try a monitor node on
+  your machine and report what `--list-devices` shows.
 - The engine shares one Mutex between the UI and the audio
   callbacks; a disk stall in the render callback can briefly stall
   input. Fine for an 8-track; a lock-free design is the next step
