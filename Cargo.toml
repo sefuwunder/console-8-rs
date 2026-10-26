@@ -1,0 +1,12 @@
+[package]
+name = "console-8-rs"
+version = "0.1.0"
+edition = "2021"
+description = "8-track tape recorder and mixer in Rust + SDL2: disk-streamed takes, per-track input selection (mic or app audio), splice-and-arrange timeline, SSL-style channel strips, and a master bus with always-on 1.5% tube distortion, maximiser and limiter"
+
+[dependencies]
+sdl2 = "0.37"
+cpal = "0.15"
+
+[profile.release]
+opt-level = 3
